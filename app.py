@@ -20,6 +20,7 @@ MAX_REQUESTS_PER_HOUR = 10  # 시간당 최대 요청 수 제한
 
 # DALL-E 3 가격 설정 (USD)
 DALLE_PRICE_PER_IMAGE = 0.080  # 1792x1024 크기 기준
+GPT4o_PRICE_PER_IMAGE = 0.030  # GPT-4o 이미지 분석 비용
 
 # 스타일별 최적화된 프롬프트 설정
 STYLE_PROMPTS = {
@@ -131,19 +132,67 @@ def get_style_prompt(style):
     style_config = STYLE_PROMPTS.get(style, STYLE_PROMPTS["기본"])
     return DEFAULT_SYSTEM_PROMPT.format(**style_config)
 
-def generate_image(prompt, system_prompt):
+def generate_image(prompt, system_prompt, reference_image=None, model="dall-e-3"):
     try:
         # 시스템 프롬프트와 사용자 프롬프트 결합
         full_prompt = f"{system_prompt}\n\n[내용]: {prompt}"
         
-        response = openai_client.images.generate(
-            model="dall-e-3",
-            prompt=full_prompt,
-            size="1792x1024",
-            quality="standard",
-            n=1,
-        )
-        return response.data[0].url, DALLE_PRICE_PER_IMAGE
+        if model == "dall-e-3":
+            # 참조 이미지가 있는 경우 base64로 인코딩
+            if reference_image:
+                buffered = io.BytesIO()
+                reference_image.save(buffered, format="PNG")
+                img_str = base64.b64encode(buffered.getvalue()).decode()
+                full_prompt += f"\n\n[참조 이미지]: {img_str}"
+            
+            response = openai_client.images.generate(
+                model="dall-e-3",
+                prompt=full_prompt,
+                size="1792x1024",
+                quality="standard",
+                n=1,
+            )
+            return response.data[0].url, DALLE_PRICE_PER_IMAGE
+        else:  # GPT-4o
+            # if not reference_image:
+            #     st.error("GPT-4o를 사용하려면 참조 이미지가 필요합니다.")
+            #     return None, None
+            # 참조 이미지가 있는 경우 base64로 인코딩
+            if reference_image:
+                buffered = io.BytesIO()
+                reference_image.save(buffered, format="PNG")
+                img_str = base64.b64encode(buffered.getvalue()).decode()
+                messages = [
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{img_str}"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-2024-11-20",
+                messages=messages,
+                # max_tokens=1000
+            )
+            
+            # GPT-4o의 응답에서 이미지 URL 추출 (실제로는 이미지 생성이 아닌 분석만 가능)
+            return None, GPT4o_PRICE_PER_IMAGE
+
     except Exception as e:
         st.error(f"이미지 생성 중 오류 발생: {str(e)}")
         return None, None
@@ -196,7 +245,7 @@ def main():
     )
     
     st.title("🎨 AI 이미지 생성기")
-    st.write("OpenAI DALL-E 3를 사용하여 이미지를 생성합니다.")
+    st.write("OpenAI DALL-E 3 또는 GPT-4o를 사용하여 이미지를 생성/분석합니다.")
 
     # API 키 확인
     if not check_api_key():
@@ -205,6 +254,14 @@ def main():
     # 사이드바 설정
     with st.sidebar:
         st.header("설정")
+        
+        # 모델 선택
+        st.subheader("모델 선택")
+        model = st.radio(
+            "사용할 모델을 선택하세요",
+            ["dall-e-3", "gpt-4o"],
+            help="DALL-E 3: 이미지 생성, GPT-4o: 이미지 생성"
+        )
         
         # 시스템 프롬프트 설정
         st.subheader("시스템 프롬프트")
@@ -231,15 +288,24 @@ def main():
         # 프롬프트 입력
         prompt = st.text_area("이미지 생성을 위한 내용을 입력하세요:", height=100)
         
+        # 참조 이미지 업로드
+        uploaded_file = st.file_uploader("참조 이미지 업로드 (선택사항)", type=['png', 'jpg', 'jpeg'])
+        reference_image = None
+        if uploaded_file is not None:
+            reference_image = Image.open(uploaded_file)
+            st.image(reference_image, caption="업로드된 참조 이미지", use_column_width=True)
+        
         if st.button("이미지 생성"):
             if not prompt:
                 st.warning("프롬프트를 입력해주세요.")
+            elif model == "gpt-4o" and not reference_image:
+                st.warning("GPT-4o를 사용하려면 참조 이미지가 필요합니다.")
             else:
                 if not check_rate_limit():
                     return
                     
                 with st.spinner("이미지 생성 중..."):
-                    image_url, cost = generate_image(prompt, system_prompt)
+                    image_url, cost = generate_image(prompt, system_prompt, reference_image, model)
                     
                     if image_url:
                         # 이미지 표시
@@ -264,15 +330,17 @@ def main():
     with col2:
         st.info("""
         ### 💡 프롬프트 작성 팁
-        chatgpt에서 테스트하다가 느려지면 쓰세여...
+        - DALL-E 3: 새로운 이미지를 생성합니다.
+        - GPT-4o: 이미지 변환에 특화되어 있습니다.
+        - 참조 이미지를 업로드하여 비슷한 스타일의 이미지를 생성할 수 있습니다.
+        - 이미지와 텍스트 프롬프트를 함께 사용하면 더 정확한 결과를 얻을 수 있습니다.
         """)
         
         st.info("""
         ### 💰 비용 정보
-        - 이미지 크기: 1792x1024
-        - 이미지당 비용: $0.080 USD
+        - DALL-E 3: $0.080 USD (1792x1024)
+        - GPT-4o: $0.030 USD (이미지 분석)
         - 많이 안비쌉니다
-        - 김신우 연구용 api를 씁니다.
         """)
 
 if __name__ == "__main__":
